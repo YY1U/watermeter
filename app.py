@@ -174,13 +174,36 @@ def save_snapshot_file(frame, status, level_m, trigger="AUTO"):
 
 
 def capture_single_sample():
-    """ดึงภาพ 1 เฟรมเพื่อคำนวณระดับน้ำสำหรับโหมด Serverless / Cloud Functions"""
+    """ดึงภาพสด ณ วินาทีปัจจุบันจาก HLS Stream (รองรับ Serverless บน Vercel)"""
+    import urllib.request
+    import re
     try:
-        cap = cv2.VideoCapture(cfg.STREAM_URL)
+        # 1. ดึง m3u8 playlist เพื่อหา TS segment ล่าสุด (หลีกเลี่ยงการติดอยู่ที่ segment แรกเมื่อ 1.6 ชม. ก่อน)
+        content = urllib.request.urlopen(cfg.STREAM_URL, timeout=3.5).read().decode('utf-8', errors='ignore')
+        ts_files = re.findall(r'(\w+\.ts)', content)
+        if ts_files:
+            latest_ts = ts_files[-1]
+            ts_url = f"http://101.109.253.60:8999/{latest_ts}"
+        else:
+            ts_url = cfg.STREAM_URL
+
+        cap = cv2.VideoCapture(ts_url)
         if not cap.isOpened():
             return None
-        ret, frame = cap.read()
+
+        # 2. กวาดเฟรมไปข้างหน้าตามเวลาจริงของวินาทีปัจจุบัน (segment ละ ~58 วินาที)
+        sec = int(time.time()) % 58
+        frames_to_grab = min(sec * 30, 1650)
+        for _ in range(frames_to_grab):
+            if not cap.grab():
+                break
+        ret, frame = cap.retrieve()
+        if not ret or frame is None:
+            # Fallback หาก retrieve ไม่ได้ ให้อ่านเฟรมเริ่มต้นของ segment
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
         cap.release()
+
         if not ret or frame is None:
             return None
 
@@ -200,7 +223,6 @@ def capture_single_sample():
             state.status = status
             state.is_connected = True
             state.last_update = time.time()
-            # อัปเดตประวัติ
             state.history.append({
                 "ts": time.time(),
                 "time": time.strftime("%H:%M:%S"),
@@ -213,6 +235,7 @@ def capture_single_sample():
     except Exception as e:
         print(f"[Sample Error] {e}")
         return None
+
 
 
 # ==========================================
@@ -370,8 +393,13 @@ def video_feed():
 
 @app.route('/api/frame')
 def api_frame():
-    """ส่งภาพ JPEG ล่าสุด 1 เฟรม (เหมาะสำหรับ Serverless / Vercel ที่จำกัดเวลาเชื่อมต่อ)"""
+    """ส่งภาพ JPEG สดล่าสุด 1 เฟรม (พร้อมปิดแคชเบราว์เซอร์และ CDN เพื่อให้ภาพเคลื่อนไหวสดตลอดเวลา)"""
     overlay = request.args.get('overlay', '1') == '1'
+
+    # ในโหมด Vercel Serverless ให้ดึงเฟรมสดตามเวลาจริงเสมอ
+    if os.environ.get("VERCEL") or state.current_frame is None or (time.time() - state.last_update > 0.8):
+        capture_single_sample()
+
     frame_to_send = None
     with state.lock:
         if overlay and state.current_frame is not None:
@@ -379,30 +407,26 @@ def api_frame():
         elif not overlay and state.raw_frame is not None:
             frame_to_send = state.raw_frame.copy()
 
-    # ถ้ายังไม่มีภาพหรืออยู่ในโหมด Serverless ให้ดึงตัวอย่างทันที
-    if frame_to_send is None:
-        capture_single_sample()
-        with state.lock:
-            frame_to_send = state.current_frame if overlay else state.raw_frame
-
     if frame_to_send is not None:
         _, buffer = cv2.imencode('.jpg', frame_to_send, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        return Response(buffer.tobytes(), mimetype='image/jpeg')
+        resp = Response(buffer.tobytes(), mimetype='image/jpeg')
     else:
         placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.putText(placeholder, "CONNECTING TO CCTV STREAM...", (120, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
         _, buffer = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        return Response(buffer.tobytes(), mimetype='image/jpeg')
+        resp = Response(buffer.tobytes(), mimetype='image/jpeg')
+
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 @app.route('/api/status')
 def api_status():
     """ส่งข้อมูล Telemetry ระดับน้ำและสถานะปัจจุบันเป็น JSON"""
-    # สำหรับโหมด Serverless: ถ้าไม่มี worker ให้สุ่มอ่านภาพเมื่อข้อมูลเก่าเกิน 5 วินาที
-    with state.lock:
-        needs_sample = (state.current_frame is None) or (time.time() - state.last_update > 5.0 and not state.is_connected)
-    if needs_sample:
+    if os.environ.get("VERCEL") or state.current_frame is None or (time.time() - state.last_update > 2.0 and not state.is_connected):
         capture_single_sample()
 
     with state.lock:
@@ -420,7 +444,9 @@ def api_status():
             },
             "alerts": state.alert_counts
         }
-    return jsonify(data)
+    resp = jsonify(data)
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+    return resp
 
 
 @app.route('/api/snapshot/take', methods=['POST'])

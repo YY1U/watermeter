@@ -336,19 +336,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // จัดการการแสดงผลวิดีโอ (อัปเดตเฟรมสดต่อเนื่อง รองรับทั้ง Local และ Vercel Serverless)
   const videoElem = document.getElementById('liveVideo');
-  let frameUpdateInterval = null;
+  let isUpdatingFrame = false;
 
   function updateVideoFrame() {
+    if (isUpdatingFrame) return;
+    isUpdatingFrame = true;
     const nextImg = new Image();
     const url = `/api/frame?overlay=${currentHudOverlay ? '1' : '0'}&t=${Date.now()}`;
     nextImg.onload = () => {
       videoElem.src = url;
+      isUpdatingFrame = false;
+    };
+    nextImg.onerror = () => {
+      isUpdatingFrame = false;
     };
     nextImg.src = url;
   }
 
-  // อัปเดตเฟรมภาพทุก 1.2 วินาที
-  frameUpdateInterval = setInterval(updateVideoFrame, 1200);
+  // อัปเดตเฟรมภาพทุก 1 วินาที
+  setInterval(updateVideoFrame, 1000);
 
   // ดึงข้อมูลครั้งแรก
   fetchTelemetry();
